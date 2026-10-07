@@ -509,8 +509,14 @@ impl ProcSampler {
                 let (Some(u), Some(k), Some(rss)) = (rest.get(11), rest.get(12), rest.get(21)) else { continue };
                 let (Ok(u), Ok(k), Ok(rss)) = (u.parse::<u64>(), k.parse::<u64>(), rss.parse::<f64>()) else { continue };
                 let ticks = u + k;
-                let wb = read_write_bytes(pid);
                 let key = Self::key(comm, pid);
+                let prev_tick = self.prev.get(&pid).map(|(t, _)| *t).unwrap_or(ticks);
+                // Only inspect disk I/O if the process actually ran or has substantial memory
+                let wb = if ticks > prev_tick || rss > 2500.0 {
+                    read_write_bytes(pid)
+                } else {
+                    self.prev.get(&pid).map(|(_, w)| *w).unwrap_or(0)
+                };
                 cur.insert(pid, (ticks, wb));
                 let g = groups.entry(key.clone()).or_insert_with(|| Group {
                     protected: PROTECTED.contains(&comm),
@@ -598,6 +604,8 @@ struct State {
     phase: f64,
     last_tick: Option<f64>,
     ring_clock: f64,
+    last_draw: Option<f64>,
+    animating: bool,
     rng: Rng,
     sensors: Sensors,
     sys: SysSampler,
@@ -627,7 +635,7 @@ struct Ui {
 }
 
 fn intensity(shown: f64) -> f64 {
-    ((shown - HOT + 3.0) / (T_MAX - HOT)).clamp(0.0, 1.0)
+    if shown < HOT { 0.0 } else { ((shown - HOT) / (T_MAX - HOT)).clamp(0.0, 1.0) }
 }
 
 fn push_cap(d: &mut VecDeque<f64>, v: f64, cap: usize) {
@@ -650,11 +658,12 @@ fn draw_hero(st: &State, cr: &cairo::Context, w: i32, h: i32) {
     let pulse = 0.5 + 0.5 * (st.phase * (3.0 + 6.0 * inten)).sin();
 
     if inten > 0.0 {
-        let g = cairo::RadialGradient::new(cx, cy, r * 0.3, cx, cy, w.max(h) * 0.75);
-        g.add_color_stop_rgba(0.0, p.red.0, p.red.1, p.red.2, 0.05 + 0.25 * inten * pulse);
+        let g = cairo::RadialGradient::new(cx, cy, r * 0.4, cx, cy, r * 1.3);
+        g.add_color_stop_rgba(0.0, p.red.0, p.red.1, p.red.2, 0.04 + 0.18 * inten * pulse);
         g.add_color_stop_rgba(1.0, p.red.0, p.red.1, p.red.2, 0.0);
         let _ = cr.set_source(&g);
-        let _ = cr.paint();
+        cr.arc(cx, cy, r * 1.3, 0.0, 2.0 * PI);
+        let _ = cr.fill();
         for rg in &st.rings {
             cr.set_line_width(3.0 * (1.0 - rg));
             cr.set_source_rgba(p.red.0, p.red.1, p.red.2, 0.6 * (1.0 - rg) * inten);
@@ -683,9 +692,9 @@ fn draw_hero(st: &State, cr: &cairo::Context, w: i32, h: i32) {
     }
 
     let frac = ((t - T_MIN) / (T_MAX - T_MIN)).clamp(0.0, 1.0);
-    let steps = ((90.0 * frac) as i32).max(1);
+    let steps = ((18.0 * frac) as i32).max(1);
     for i in 0..steps {
-        let (f0, f1) = (i as f64 / 90.0, (i + 1) as f64 / 90.0);
+        let (f0, f1) = (i as f64 / 18.0, (i + 1) as f64 / 18.0);
         let c = p.heat(T_MIN + (T_MAX - T_MIN) * f0);
         cr.set_source_rgb(c.0, c.1, c.2);
         cr.set_line_width(12.0);
@@ -846,6 +855,7 @@ fn update_sensors(ui: &Rc<Ui>) {
     ui.v_disk.set_text(&format!("{}/s", fmt_bytes(s.disk_w)));
     ui.s_disk.set_text(&trf("read", &[fmt_bytes(s.disk_r)]));
     ui.spark.queue_draw();
+    ensure_animating(ui);
     for m in &ui.minis {
         m.queue_draw();
     }
@@ -1037,18 +1047,65 @@ fn kill_group(ui: &Rc<Ui>, g: &Group) {
     ui.toasts.add_toast(adw::Toast::new(&trf("closing", &[g.key.clone()])));
 }
 
+
+fn ensure_animating(ui: &Rc<Ui>) {
+    let mut st = ui.st.borrow_mut();
+    if st.animating {
+        return;
+    }
+    st.animating = true;
+    drop(st);
+
+    let u = ui.clone();
+    glib::timeout_add_local(Duration::from_millis(33), move || {
+        let now = glib::monotonic_time() as f64 / 1e6;
+        let mut s = u.st.borrow_mut();
+        let cont = on_tick(&mut s, now);
+        if cont {
+            u.hero.queue_draw();
+            glib::ControlFlow::Continue
+        } else {
+            s.animating = false;
+            u.hero.queue_draw();
+            glib::ControlFlow::Break
+        }
+    });
+}
+
 fn on_tick(st: &mut State, t: f64) -> bool {
-    let dt = st.last_tick.map_or(0.016, |l| (t - l).min(0.1));
+    let diff = st.target - st.shown;
+    let inten = intensity(st.shown);
+    if diff.abs() < 0.6 && inten == 0.0 && st.parts.is_empty() && st.rings.is_empty() {
+        st.shown = st.target;
+        return false;
+    }
+    let animating = inten > 0.0 || !st.parts.is_empty() || !st.rings.is_empty() || diff.abs() >= 0.6;
+
+    if !animating {
+        st.shown = st.target;
+        st.last_tick = Some(t);
+        return false;
+    }
+
+    // Limit animation frame rate to 30 FPS to save CPU (especially on high-refresh 144Hz displays)
+    if let Some(ld) = st.last_draw {
+        if t - ld < 0.033 {
+            return false;
+        }
+    }
+    st.last_draw = Some(t);
+
+    let dt = st.last_tick.map_or(0.033, |l| (t - l).min(0.1));
     st.last_tick = Some(t);
     st.phase += dt;
-    let diff = st.target - st.shown;
-    if diff.abs() > 0.02 {
+    if diff.abs() > 0.05 {
         st.shown += diff * (dt * 4.0).min(1.0);
+    } else {
+        st.shown = st.target;
     }
-    let inten = intensity(st.shown);
-    let animating = inten > 0.0 || !st.parts.is_empty() || !st.rings.is_empty() || diff.abs() > 0.02;
+
     if inten > 0.0 {
-        if st.rng.next() < inten * 60.0 * dt * 0.9 {
+        if st.rng.next() < inten * 30.0 * dt {
             let p = Particle {
                 x: st.rng.range(-1.0, 1.0),
                 y: 0.0,
@@ -1075,7 +1132,7 @@ fn on_tick(st: &mut State, t: f64) -> bool {
         *r += dt * 0.8;
     }
     st.rings.retain(|r| *r < 1.0);
-    animating
+    true
 }
 
 /// Si el tema de Omarchy cambió, recarga paleta y CSS sin reiniciar.
@@ -1096,6 +1153,7 @@ fn apply_theme(ui: &Rc<Ui>, force: bool) {
     ui.st.borrow_mut().pal = new;
     ui.hero.queue_draw();
     ui.spark.queue_draw();
+    ensure_animating(ui);
     for m in &ui.minis {
         m.queue_draw();
     }
@@ -1154,6 +1212,8 @@ fn build_ui(app: &adw::Application) {
         rings: vec![],
         phase: 0.0,
         last_tick: None,
+        last_draw: None,
+        animating: false,
         ring_clock: 0.0,
         rng: Rng(seed),
         sensors: Sensors::new(),
@@ -1313,14 +1373,8 @@ fn build_ui(app: &adw::Application) {
         }
     });
 
-    let s = st.clone();
-    hero.add_tick_callback(move |w, clock| {
-        let t = clock.frame_time() as f64 / 1e6;
-        if on_tick(&mut s.borrow_mut(), t) {
-            w.queue_draw();
-        }
-        glib::ControlFlow::Continue
-    });
+    let u_init = ui.clone();
+    ensure_animating(&u_init);
 
     apply_theme(&ui, true);
     update_sensors(&ui);
@@ -1336,7 +1390,7 @@ fn build_ui(app: &adw::Application) {
         glib::ControlFlow::Continue
     });
     let u = ui.clone();
-    glib::timeout_add_seconds_local(2, move || {
+    glib::timeout_add_seconds_local(6, move || {
         apply_theme(&u, false);
         glib::ControlFlow::Continue
     });
