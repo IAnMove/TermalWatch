@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ianmove.thermalwatch",
+  "name": "ThermalWatch",
+  "version": "1.0.0",
+  "author": "IAnMove",
+  "license": "MIT",
+  "description": "Temperature and hardware monitor with panic-kill emergency popup and status bar widget for Omarchy.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "ThermalWatch",
+    "category": "Monitoring",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
